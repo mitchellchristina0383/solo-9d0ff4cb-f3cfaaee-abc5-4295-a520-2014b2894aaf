@@ -45,3 +45,38 @@ def token_text(prompt: str, index: int) -> str:
 
 def expected_token_ids(prompt: str, start: int, end: int) -> list[int]:
     return [token_id(prompt, i) for i in range(start, end)]
+
+
+# ---------------------------------------------------------------------------
+# Draft decoding helpers.
+#
+# The draft (backup) node proposes speculative continuations that the primary
+# node then verifies. Healthy drafts reuse the same pure function and therefore
+# match position for position. A divergent proposal is produced by a *second*
+# pure function (different hash prefix, "+1" over the vocab) — still fully
+# deterministic and reproducible, and guaranteed to differ from the primary's
+# token at that position, which is what lets the UI demonstrate an in-batch
+# rejection/replacement.
+# ---------------------------------------------------------------------------
+
+def _draft_digest(prompt: str, index: int) -> bytes:
+    h = hashlib.sha256()
+    h.update(b"mock-llm-draft/v1:")
+    h.update(prompt.encode("utf-8"))
+    h.update(b":")
+    h.update(str(index).encode("ascii"))
+    return h.digest()
+
+
+def draft_token_id(prompt: str, index: int) -> int:
+    """Deterministic draft proposal; always differs from :func:`token_id`."""
+    vocab = load_vocab()
+    primary = token_id(prompt, index)
+    candidate = int.from_bytes(_draft_digest(prompt, index)[:4], "big") % len(vocab)
+    if candidate == primary:
+        candidate = (candidate + 1) % len(vocab)
+    return candidate
+
+
+def draft_token_text(prompt: str, index: int) -> str:
+    return load_vocab()[draft_token_id(prompt, index)]

@@ -3,6 +3,7 @@ const form = document.getElementById("chat-form");
 const promptInput = document.getElementById("prompt");
 const maxTokensInput = document.getElementById("max-tokens");
 const scenarioSelect = document.getElementById("scenario");
+const draftCheckbox = document.getElementById("draft");
 const runBtn = document.getElementById("run-btn");
 const statusEl = document.getElementById("status");
 const outputEl = document.getElementById("output");
@@ -21,8 +22,22 @@ async function loadScenarios() {
     const opt = document.createElement("option");
     opt.value = s.id;
     opt.textContent = s.id;
+    opt.dataset.draft = s.draft ? "1" : "0";
     scenarioSelect.appendChild(opt);
   }
+  // The scenario catalog differs between normal and draft-decoding modes.
+  function syncScenarioOptions() {
+    const draftMode = draftCheckbox.checked;
+    let firstVisible = null;
+    for (const opt of scenarioSelect.options) {
+      const visible = opt.dataset.draft === (draftMode ? "1" : "0");
+      opt.hidden = !visible;
+      if (visible && !firstVisible) firstVisible = opt;
+    }
+    if (firstVisible) scenarioSelect.value = firstVisible.value;
+  }
+  draftCheckbox.addEventListener("change", syncScenarioOptions);
+  syncScenarioOptions();
 }
 
 function setStatus(kind, text) {
@@ -56,7 +71,12 @@ function appendToken(obj) {
   const chip = document.createElement("span");
   chip.className = `token ${obj.node}`;
   chip.dataset.index = obj.index;
-  chip.title = `index=${obj.index} id=${obj.id} 来源=${obj.node}`;
+  const origin = obj.accepted_as === "draft_match"
+    ? "草稿核验通过"
+    : obj.accepted_as === "primary_replacement"
+      ? "首节点替换"
+      : "流式生成";
+  chip.title = `index=${obj.index} id=${obj.id} 来源=${obj.node}（${origin}）`;
   chip.textContent = obj.text;
   outputEl.appendChild(chip);
   counterEl.textContent = `已采纳词元：${obj.index + 1}`;
@@ -146,6 +166,7 @@ async function run() {
     prompt: promptInput.value,
     max_tokens: parseInt(maxTokensInput.value, 10),
     scenario: scenarioSelect.value,
+    draft: draftCheckbox.checked,
   };
 
   try {
@@ -162,11 +183,27 @@ async function run() {
       const obj = JSON.parse(data);
       switch (event) {
         case "meta":
-          addEvent("", `请求 ${obj.request_id.slice(0, 8)}… 场景=<b>${obj.scenario}</b>，词元上限=${obj.max_tokens}`);
+          addEvent("", `请求 ${obj.request_id.slice(0, 8)}… 场景=<b>${obj.scenario}</b>`
+            + `${obj.draft ? "（草稿解码，每批 ≤ " + obj.draft_batch_size + " 个词元）" : ""}`
+            + `，词元上限=${obj.max_tokens}`);
           break;
         case "token":
           appendToken(obj);
           tokens.push(obj);
+          break;
+        case "draft_batch": {
+          const verdict = obj.replaced
+            ? `，第 ${obj.matched + 1} 个不符 → 首节点替换 1 个、丢弃批内剩余 ${obj.discarded} 个草稿`
+            : "，整批匹配";
+          addEvent(obj.replaced ? "warn" : "ok",
+            `🔎 第 ${obj.batch} 批核验（起始 index=${obj.start_index}，草稿 ${obj.draft_count} 个）`
+            + `${verdict} —— 本批追加 <b>${obj.appended}</b> 个词元，已确认 ${obj.confirmed_count} 个。`);
+          break;
+        }
+        case "draft_fallback":
+          addEvent("warn",
+            `⚠️ 草稿节点 ${obj.reason === "draft_timeout" ? "超时" : obj.reason === "version_mismatch" ? "身份不一致" : "出错"}`
+            + `（已确认 ${obj.accepted_count} 个词元），改由首节点 <b>node-a</b> 从已确认位置接着生成…`);
           break;
         case "fallback":
           addEvent("warn",
@@ -178,7 +215,9 @@ async function run() {
           break;
         case "done":
           renderShares(obj.nodes);
-          addEvent("ok", `✔ 完成：共 ${obj.token_count} 个词元`);
+          addEvent("ok",
+            `✔ 完成：共 ${obj.token_count} 个词元`
+            + `${obj.draft ? `，经过 ${obj.draft_batches} 批草稿核验` : ""}`);
           break;
         default:
           addEvent("", JSON.stringify(obj));

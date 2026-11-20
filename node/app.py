@@ -32,7 +32,14 @@ from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from common.deterministic import expected_token_ids, load_vocab, token_id, token_text
+from common.deterministic import (
+    draft_token_id,
+    draft_token_text,
+    expected_token_ids,
+    load_vocab,
+    token_id,
+    token_text,
+)
 
 logger = logging.getLogger("mocknode")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
@@ -53,6 +60,34 @@ class GenerateRequest(BaseModel):
     max_tokens: int = Field(gt=0)
     accepted_ids: list[int] = Field(default_factory=list)
     prefix_text: str = ""
+    stall_before: int | None = Field(default=None, ge=0)
+    fail_at: int | None = Field(default=None, ge=0)
+
+
+class DraftRequest(BaseModel):
+    """One speculative batch: propose up to ``max_tokens`` draft tokens that
+    continue after the already-confirmed prefix."""
+    request_id: str
+    prompt: str = Field(min_length=1)
+    start: int = Field(ge=0)
+    max_tokens: int = Field(gt=0, le=4)
+    accepted_ids: list[int] = Field(default_factory=list)
+    prefix_text: str = ""
+    # Absolute index from which the draft model diverges from the primary
+    # (None = healthy draft, proposals reproduce the primary's stream).
+    draft_diverge_at: int | None = Field(default=None, ge=0)
+    stall_before: int | None = Field(default=None, ge=0)
+    fail_at: int | None = Field(default=None, ge=0)
+
+
+class VerifyRequest(BaseModel):
+    """Primary node verifies one draft batch and returns its own tokens for
+    the same absolute positions."""
+    request_id: str
+    prompt: str = Field(min_length=1)
+    start: int = Field(ge=0)
+    draft_ids: list[int] = Field(min_length=1, max_length=4)
+    accepted_ids: list[int] = Field(default_factory=list)
     stall_before: int | None = Field(default=None, ge=0)
     fail_at: int | None = Field(default=None, ge=0)
 
@@ -188,6 +223,122 @@ def create_app(config: NodeConfig | None = None) -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    # ------------------------------------------------------------------
+    # Draft decoding: speculative /draft proposal and primary /verify.
+    # Both are plain JSON endpoints (the gateway requests one batch at a
+    # time, so SSE framing adds nothing); they accept the same stall/fail
+    # fault injection and the same prefix-verification contract.
+    # ------------------------------------------------------------------
+
+    def _check_prefix(prompt: str, start: int, accepted_ids: list[int], req_id: str):
+        if start > 0:
+            expected_prefix = expected_token_ids(prompt, 0, start)
+            if accepted_ids != expected_prefix:
+                logger.warning(
+                    "%s prefix mismatch for %s: expected %s got %s",
+                    cfg.node_id, req_id, expected_prefix, accepted_ids,
+                )
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": "prefix_verification_failed",
+                             "expected_ids": expected_prefix},
+                )
+        return None
+
+    @app.post("/draft")
+    async def draft(
+        body: DraftRequest,
+        x_mock_stall_seconds: float | None = Header(default=None),
+        x_mock_fail_at: float | None = Header(default=None),
+    ):
+        fail_at = body.fail_at if body.fail_at is not None else (
+            int(x_mock_fail_at) if x_mock_fail_at is not None else None
+        )
+        bad = _check_prefix(body.prompt, body.start, body.accepted_ids, body.request_id)
+        if bad is not None:
+            return bad
+        if fail_at is not None and fail_at <= body.start:
+            logger.warning("%s draft injected failure at index %s for %s",
+                           cfg.node_id, fail_at, body.request_id)
+            return JSONResponse(status_code=500,
+                                content={"error": "injected_failure", "at": fail_at})
+        if body.stall_before is not None and body.start >= body.stall_before:
+            logger.warning(
+                "%s draft stalling for %ss at start index %s (request %s) — caller will time out",
+                cfg.node_id, x_mock_stall_seconds or "inf", body.start, body.request_id,
+            )
+            if x_mock_stall_seconds:
+                await asyncio.sleep(x_mock_stall_seconds)
+            else:
+                while True:
+                    await asyncio.sleep(3600)
+
+        tokens = []
+        for offset in range(body.max_tokens):
+            index = body.start + offset
+            if fail_at is not None and index == fail_at:
+                return JSONResponse(status_code=500,
+                                    content={"error": "injected_failure", "at": index})
+            if body.draft_diverge_at is not None and index >= body.draft_diverge_at:
+                tok_id = draft_token_id(body.prompt, index)
+                text = draft_token_text(body.prompt, index)
+            else:
+                tok_id = token_id(body.prompt, index)
+                text = token_text(body.prompt, index)
+            tokens.append({"index": index, "id": tok_id, "text": text,
+                           "node": cfg.node_id})
+        return {
+            "node_id": cfg.node_id,
+            "start": body.start,
+            "diverged": body.draft_diverge_at is not None,
+            "tokens": tokens,
+        }
+
+    @app.post("/verify")
+    async def verify(
+        body: VerifyRequest,
+        x_mock_stall_seconds: float | None = Header(default=None),
+        x_mock_fail_at: float | None = Header(default=None),
+    ):
+        fail_at = body.fail_at if body.fail_at is not None else (
+            int(x_mock_fail_at) if x_mock_fail_at is not None else None
+        )
+        bad = _check_prefix(body.prompt, body.start, body.accepted_ids, body.request_id)
+        if bad is not None:
+            return bad
+        if fail_at is not None and fail_at <= body.start:
+            logger.warning("%s verify injected failure at index %s for %s",
+                           cfg.node_id, fail_at, body.request_id)
+            return JSONResponse(status_code=500,
+                                content={"error": "injected_failure", "at": fail_at})
+        if body.stall_before is not None and body.start >= body.stall_before:
+            logger.warning(
+                "%s verify stalling for %ss at start index %s (request %s) — caller will time out",
+                cfg.node_id, x_mock_stall_seconds or "inf", body.start, body.request_id,
+            )
+            if x_mock_stall_seconds:
+                await asyncio.sleep(x_mock_stall_seconds)
+            else:
+                while True:
+                    await asyncio.sleep(3600)
+
+        tokens = []
+        for offset, draft_id in enumerate(body.draft_ids):
+            index = body.start + offset
+            if fail_at is not None and index == fail_at:
+                return JSONResponse(status_code=500,
+                                    content={"error": "injected_failure", "at": index})
+            primary_id = token_id(body.prompt, index)
+            tokens.append({"index": index, "id": primary_id,
+                           "text": token_text(body.prompt, index),
+                           "node": cfg.node_id, "draft_id": draft_id,
+                           "match": draft_id == primary_id})
+        return {
+            "node_id": cfg.node_id,
+            "start": body.start,
+            "tokens": tokens,
+        }
 
     return app
 

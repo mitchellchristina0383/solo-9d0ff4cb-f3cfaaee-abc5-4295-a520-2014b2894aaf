@@ -6,6 +6,13 @@
 场景**逐词元完全一致**；两节点模型/分词器版本不一致或备用续写失败时，保留已
 显示文本并标记为**未完成**。
 
+勾选「**草稿解码**」后切换为投机解码（speculative decoding）编排：备用节点
+node-b 作为**草稿节点**从已确认前缀接着提议，每批最多 4 个词元；首节点 node-a
+一次**整批核验**。匹配的前缀词元直接采纳并下发网页，遇到第一个不符词元就用首
+节点词元替换、丢弃该批剩余草稿，再从新的已确认位置继续。草稿节点超时/报错时
+首节点从已确认位置自行续写；首节点无法继续时网页保留已收到的内容并标为未完成。
+完整回复与首节点独立生成**逐词元一致**，并共用同一个词元上限。
+
 ## 架构
 
 ```
@@ -21,8 +28,11 @@
 * `node/app.py`：同一个 FastAPI 应用部署为 node-a / node-b 两个实例，SSE 流式
   输出 `meta / token / error / done` 事件；支持按请求注入挂起、失败、版本伪装，
   并在挂起后由脱离请求的后台任务继续产生「迟到回包」（记录在 `/debug/late`）。
+  另提供草稿解码用的 JSON 接口 `/draft`（按批提议，最多 4 个）与 `/verify`
+  （首节点整批核验，逐位置返回 match 标记）。
 * `gateway/app.py`：编排状态机，负责读超时判定、只追加接受、共享预算、身份校验
-  与故障切换，并向浏览器转发 SSE 事件。
+  与故障切换，并向浏览器转发 SSE 事件；勾选草稿解码时改走 `_orchestrate_draft`
+  投机解码状态机（提议 → 整批核验 → 前缀采纳/首处替换 → 失败回退）。
 * `web/`：原生 HTML/CSS/JS 单页，逐词元渲染（按来源节点着色）、展示切换/未完成
   事件，并自动与 `/api/expected` 的无故障基准核对。
 
@@ -43,8 +53,9 @@ docker compose up --build
 
 ```bash
 python -m pip install -r requirements.txt
-python run_demo.py          # 真实 uvicorn + HTTP 跑全部 4 个场景并打印核对报告
-python -m pytest            # 8 项端到端/单元行为测试
+python run_demo.py          # 真实 uvicorn + HTTP 跑全部 4 个故障切换场景并打印核对报告
+python run_draft_demo.py    # 同样方式跑全部 6 个草稿解码场景（含每批追加词元数）
+python -m pytest            # 17 项端到端/单元行为测试（8 项故障切换 + 9 项草稿解码）
 ```
 
 ## 四个演示场景（网关侧按请求注入，可重复）
@@ -55,6 +66,39 @@ python -m pytest            # 8 项端到端/单元行为测试
 | `failover_success` | 第 4 个词元后挂起 → 网关读超时 | 用原提示词 + 4 个已采纳词元续写 | 12/12，与 healthy **完全一致** |
 | `failover_backup_error` | 同上挂起 | 续写至绝对下标 7 时失败 | 保留 7 个词元，标记未完成 |
 | `version_mismatch` | 同上挂起 | 伪装为 `mock-llm-7b-hotfix` / `tok-v2` | 拒绝接续，保留 4 个词元，标记未完成 |
+
+### 草稿解码场景（勾选网页「草稿解码」后可用）
+
+| 场景 | 首节点 node-a（核验） | 草稿节点 node-b（提议） | 最终结果 |
+|---|---|---|---|
+| `draft_all_match` | 整批核验通过 | 健康草稿，提议与首节点逐词元相同 | 3 批 ×4 全部采纳，12/12 |
+| `draft_replace` | 整批核验，返回首节点词元 | 从绝对下标 2 起按另一确定性函数发散 | 批内前缀采纳 + 首处替换、丢弃批内剩余；12/12 与基准一致 |
+| `draft_timeout` | 第二批起改为自行流式生成 | 第二批草稿请求挂起 → 网关读超时 | 4 个草稿词元 + 8 个首节点词元，12/12 |
+| `draft_error` | 第三批起改为自行流式生成 | 第三批草稿请求 HTTP 500 | 8 个草稿词元 + 4 个首节点词元，12/12 |
+| `draft_primary_fail` | 核验第二批时失败、无法继续 | 健康草稿 | 保留 4 个已确认词元，标记未完成 |
+| `draft_version_mismatch` | 独立生成整条回复 | 伪装为不同模型/分词器版本 | 不发起草稿，12/12 全部来自 node-a |
+
+草稿批大小由网关配置 `DRAFT_BATCH_SIZE`（默认 4，可用环境变量覆盖），最后一批
+自动裁剪到剩余词元预算。
+
+## 草稿解码的请求与事件
+
+* 节点新增两个 JSON 接口（与 `/generate` 共用同一前缀校验和故障注入约定）：
+  * `POST /draft`：入参 `prompt/start/max_tokens(≤4)/accepted_ids`，返回该批草稿
+    词元；`draft_diverge_at` 之后改用草稿模型自己的确定性函数（保证与首节点在该
+    位置不同），同样支持 `stall_before` / `fail_at` 注入。
+  * `POST /verify`：入参 `prompt/start/draft_ids(1–4)/accepted_ids`，首节点返回
+    每个位置自己的词元及 `match` 布尔；同样支持挂起/失败注入。
+* 网关 → 浏览器在原事件之外新增：
+  * `draft_batch`：每批核验结果，含 `matched`（匹配采纳数）、`replaced`（是否
+    发生替换）、`rejected`（未采纳草稿数）、`discarded`（替换点之后被丢弃的批内
+    草稿数）、`appended`（**本批实际追加的词元数**）、`confirmed_count`。
+  * `draft_fallback`：草稿节点超时/报错/身份不一致，草稿停用、首节点接管。
+  * `token` 事件新增 `draft_batch` 与 `accepted_as`（`draft_match` /
+    `primary_replacement`），网页据此着色并在悬停提示里标明来源。
+* 正确性保证：每个下发词元要么是核验通过的草稿（与首节点词元 id 相同），要么
+  直接来自首节点替换，因此完整回复恒等于首节点独立生成；`max_tokens` 仍是全流
+  唯一预算，批大小只影响每批请求多少个词元。
 
 ## 需求与实现的对应
 
@@ -75,35 +119,57 @@ python -m pytest            # 8 项端到端/单元行为测试
    node-b `/info` 比对 `(model_id, tokenizer_version)`，不一致直接发 `incomplete`
    且不发起续写；续写流返回错误或提前结束同样发 `incomplete`，事件中带回完整
    `prefix_text`，已下发词元不会被撤回或改写。
+7. **草稿解码**：网页勾选后网关走投机解码状态机 —— node-b `/draft` 从已确认
+   前缀提议 ≤4 个词元，node-a `/verify` 一次核验整批；匹配前缀按 `draft_match`
+   下发，首个不符位置用首节点词元 `primary_replacement` 替换并丢弃批内剩余草稿，
+   每批发一条 `draft_batch` 告知网页**本批追加了几个词元**；草稿超时/报错发
+   `draft_fallback` 后由首节点从已确认位置流式续写，首节点无法继续则发
+   `incomplete` 保留已确认前缀。全流仍只有 `max_tokens` 一个预算，完整回复与
+   首节点独立生成逐词元一致（测试与页面对照 `/api/expected` 双重断言）。
 
 ## SSE 事件（网关 → 浏览器）
 
-`meta`（请求信息）→ 若干 `token`（含绝对下标 index、词元 id、来源 node）→
-可能的 `fallback`（切换原因与已采纳数）→ 更多 `token` → `done`（完成，含各节点
-词元占比）或 `incomplete`（原因、身份信息、保留前缀）。
+故障切换模式：`meta`（请求信息）→ 若干 `token`（含绝对下标 index、词元 id、
+来源 node）→ 可能的 `fallback`（切换原因与已采纳数）→ 更多 `token` →
+`done`（完成，含各节点词元占比）或 `incomplete`（原因、身份信息、保留前缀）。
+
+草稿解码模式：`meta`（含 `draft=true` 与批大小）→ 每轮 `token`（0–4 个，标注
+`accepted_as`）+ 一条 `draft_batch`（本批匹配/替换/丢弃与**追加词元数**）→
+可能的 `draft_fallback`（草稿停用、首节点接管）→ `done` 或 `incomplete`。
 
 ## 验证结果
 
 本机（无 Docker，使用真实 uvicorn socket）已跑通：
 
-* `python -m pytest`：**8/8 通过**，覆盖健康基准、接续等价性、共享预算、备用
-  失败、版本不一致、迟到回包被忽略、节点前缀校验、跨节点/跨次确定性。
-* `python run_demo.py`：四个场景全部通过自动核对。failover_success 的最终词元
-  序列与 healthy 逐位相同（node-a 4 个 + node-b 8 个）；两个失败场景保留前缀与
-  基准同位置前缀一致；node-a 被放弃后确实产生了迟到词元且均未被采纳。
+* `python -m pytest`：**17/17 通过**。原 8 项覆盖健康基准、接续等价性、共享
+  预算、备用失败、版本不一致、迟到回包被忽略、节点前缀校验、跨节点/跨次确定性；
+  新增 9 项覆盖整批匹配、批内替换（含逐批追加数与丢弃数）、草稿超时/报错回退、
+  首节点核验失败保留前缀、草稿身份不一致、共享预算与严格顺序、末批裁剪，以及
+  `/draft`、`/verify` 的节点级契约（发散确定性、4 个上限、409 前缀校验、match
+  标记）。
+* `python run_demo.py`：四个故障切换场景全部通过自动核对。failover_success 的
+  最终词元序列与 healthy 逐位相同（node-a 4 个 + node-b 8 个）；两个失败场景
+  保留前缀与基准同位置前缀一致；node-a 被放弃后确实产生了迟到词元且均未被采纳。
+* `python run_draft_demo.py`：六个草稿场景全部通过。draft_all_match 三批各追加
+  4 个；draft_replace 首批追加 3 个（匹配 2 + 替换 1、丢弃 1），其后每批追加 1
+  个；draft_timeout/draft_error 回退后由 node-a 补齐；draft_primary_fail 保留 4
+  个已确认词元并标记未完成；所有完整回复均与 healthy 基准逐词元一致。
 * 静态资源冒烟：`/`、`/app.js`、`/styles.css` 与各 API 均 200。
 
 ## 遗留事项与简化
 
 1. **Docker Compose 文件未在本机构建验证**：当前环境没有 docker 守护进程；
-   compose/Dockerfile 仅做了 YAML 与结构校验，首次 `docker compose up --build`
-   建议在有 Docker 的环境确认一次（镜像基于 `python:3.11-slim`，结构与本地
-   uvicorn 启动方式一致）。
+   compose/Dockerfile 仅做了 YAML 与结构校验，本次改动未新增服务或构建依赖
+   （仍为 node-a、node-b、gateway 三个原服务，新接口随同一镜像交付），首次
+   `docker compose up --build` 建议在有 Docker 的环境确认一次（镜像基于
+   `python:3.11-slim`，结构与本地 uvicorn 启动方式一致）。
 2. 故障注入是**演示机制**：场景表和 `X-Mock-*` 头只用于可重复演示，生产网关
    不会信任节点的自我身份声明；真实系统应改用带外配置/证书校验模型身份。
 3. 仅模拟单一首要→单一备用、一次切换；未实现多级备用、重试退避、熔断与
-   跨请求持久化（迟到回包记录保存在节点内存中，重启即失）。
+   跨请求持久化（迟到回包记录保存在节点内存中，重启即失）。草稿模式下草稿
+   节点一旦超时/报错即永久停用并由首节点接管，未实现草稿节点的重新启用。
 4. 确定性「模型」用词表哈希代替真实推理，重点是可复现的词元契约与切换语义，
-   不代表真实 LLM 的解码质量。
+   不代表真实 LLM 的解码质量。草稿模型的发散用第二个哈希纯函数模拟，只为
+   确定性地演示「批内替换」。
 5. 前端为零依赖原生页面，未做无障碍/国际化等增强；接口仅做了基本入参校验
-   （提示词长度、词元上限 1–128）。
+   （提示词长度、词元上限 1–128、草稿批 1–4）。

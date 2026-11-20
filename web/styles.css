@@ -43,6 +43,9 @@ input:focus, select:focus { outline: 1px solid var(--accent); }
 .row { display: flex; gap: 12px; align-items: flex-end; }
 .grow-1 { flex: 1; }
 .grow-2 { flex: 2; }
+.checkbox-line { display: flex; align-items: center; gap: 8px; color: var(--text); }
+.checkbox-line input[type="checkbox"] { width: auto; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.checkbox-line span { font-size: 13px; }
 button {
   padding: 10px 22px;
   border: 0;

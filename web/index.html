@@ -31,6 +31,12 @@
           </label>
         </div>
         <div class="row">
+          <label class="checkbox-line">
+            <input id="draft" type="checkbox" />
+            <span>草稿解码（备用节点按批提议 ≤4 个词元，首节点整批核验）</span>
+          </label>
+        </div>
+        <div class="row">
           <button type="submit" id="run-btn">生成回复</button>
           <span id="status" class="status idle">空闲</span>
         </div>
@@ -58,9 +64,18 @@
         <li><b>failover_backup_error</b>：首节点超时，备用节点续写途中失败 —— 保留已显示文本并标记未完成。</li>
         <li><b>version_mismatch</b>：首节点超时，备用节点模型/分词器版本不一致 —— 不接续，保留已显示文本并标记未完成。</li>
       </ul>
+      <ul class="legend">
+        <li>勾选「草稿解码」后使用下面的草稿场景（备用节点 node-b 为草稿节点，首节点 node-a 整批核验）：</li>
+        <li><b>draft_all_match</b>：草稿与首节点逐词元一致，每批 4 个全部采纳。</li>
+        <li><b>draft_replace</b>：草稿从第 2 个绝对下标起发散 —— 批内前缀照常采纳，首个不符词元由首节点词元替换，丢弃批内剩余草稿。</li>
+        <li><b>draft_timeout</b>：第二批草稿请求挂起超时 —— 首节点从已确认位置自行续写。</li>
+        <li><b>draft_error</b>：第三批草稿请求报错 —— 首节点从已确认位置自行续写。</li>
+        <li><b>draft_primary_fail</b>：首节点核验第二批时失败、无法继续 —— 保留已确认内容并标记未完成。</li>
+        <li><b>draft_version_mismatch</b>：草稿节点身份不一致 —— 不使用草稿，首节点独立生成整条回复。</li>
+      </ul>
       <p class="legend">
-        词元颜色：<span class="chip node-a">node-a（首节点）</span>
-        <span class="chip node-b">node-b（备用节点）</span>
+        词元颜色：<span class="chip node-a">node-a（首节点 / 替换词元）</span>
+        <span class="chip node-b">node-b（备用 / 已核验草稿词元）</span>
       </p>
     </section>
   </main>
